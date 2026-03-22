@@ -1,18 +1,17 @@
 import express, { Request, Response } from 'express';
 import { applyFixToGitHub } from './github-file.js';
 import { ApplyRequest, ApplyResponse } from './types.js';
+import { callLLM } from './llm-router.js';
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT ?? '8080';
 
-// Health check
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', bot: 'openclaw-coder', version: '1.0.0' });
+  res.json({ status: 'ok', bot: 'openclaw-coder', version: '1.1.0' });
 });
 
-// Apply fix endpoint
 app.post('/apply', async (req: Request, res: Response) => {
   console.log('[Coder] Received /apply request');
 
@@ -29,7 +28,6 @@ app.post('/apply', async (req: Request, res: Response) => {
 
   const fix = body.fix;
 
-  // Basic field checks
   if (typeof fix.file !== 'string' || !fix.file.startsWith('src/') || !fix.file.endsWith('.ts')) {
     const response: ApplyResponse = {
       status: 'error',
@@ -82,8 +80,10 @@ app.post('/apply', async (req: Request, res: Response) => {
   }
 });
 
-// Boot
 app.listen(parseInt(PORT), '0.0.0.0', () => {
-  console.log('[Coder] Boot confirmed — openclaw-coder v1.0.0');
+  console.log('[Coder] Boot confirmed — openclaw-coder v1.1.0');
+  console.log('[Coder] LLM router loaded — task: code_generation');
   console.log(`[Coder] Health server on port ${PORT}`);
 });
+
+void callLLM;
