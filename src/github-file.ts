@@ -1,4 +1,7 @@
 import { Octokit } from '@octokit/rest';
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { FixSuggestion } from './types.js';
 import { applyFix } from './apply-fix.js';
 
@@ -6,9 +9,46 @@ const owner = process.env.GITHUB_OWNER ?? '';
 const repo = process.env.GITHUB_REPO ?? '';
 const pat = process.env.GITHUB_PAT ?? '';
 
-const octokit = new Octokit({ auth: pat });
+const QDRANT_URL = process.env.QDRANT_URL || '';
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY || '';
+const CODER_LOGS_COLLECTION = 'coder_logs';
+const DIMS = 384;
 
 console.log(`[INFO] github-file loaded for ${owner}/${repo}`);
+
+// ── Qdrant helper ─────────────────────────────────────────────────────────────
+
+async function writeCoderLog(payload: Record<string, unknown>): Promise<void> {
+  if (!QDRANT_URL || !QDRANT_API_KEY) {
+    console.warn('[Coder] QDRANT_URL or QDRANT_API_KEY not set — skipping coder_logs write');
+    return;
+  }
+
+  const dummyVector = Array(DIMS).fill(0);
+  dummyVector[0] = 0.001;
+
+  const id = crypto.randomUUID();
+
+  const res = await fetch(`${QDRANT_URL}/collections/${CODER_LOGS_COLLECTION}/points`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': QDRANT_API_KEY,
+    },
+    body: JSON.stringify({
+      points: [{ id, vector: dummyVector, payload }],
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`[Coder] Qdrant upsert failed: ${res.status} ${text}`);
+  }
+
+  console.log(`[Coder] coder_logs point written: ${id}`);
+}
+
+// ── GitHub helpers ────────────────────────────────────────────────────────────
 
 async function withRateLimitRetry<T>(fn: () => Promise<T>, attempt = 1): Promise<T> {
   try {
@@ -25,10 +65,15 @@ async function withRateLimitRetry<T>(fn: () => Promise<T>, attempt = 1): Promise
   }
 }
 
+// ── Main export ───────────────────────────────────────────────────────────────
+
 export async function applyFixToGitHub(fix: FixSuggestion): Promise<{
   branch: string;
   commitSha: string;
 }> {
+  const octokit = new Octokit({ auth: pat });
+  const timestamp = new Date().toISOString();
+
   // Step 1 — Get current main branch SHA
   console.log('[Coder] Fetching main branch SHA...');
   const mainRef = await withRateLimitRetry(() =>
@@ -64,11 +109,33 @@ export async function applyFixToGitHub(fix: FixSuggestion): Promise<{
     throw e;
   }
 
+  // Capture oldContent before applying fix
+  const lines = fileContent.split('\n');
+  const oldContent = lines[fix.line - 1] ?? '';
+  console.log(`[Coder] Old content at line ${fix.line}: ${oldContent.slice(0, 80)}`);
+
   // Step 3 — Apply the fix
   console.log(`[Coder] Applying fix: ${fix.action} on line ${fix.line}`);
   const result = applyFix(fileContent, fix);
 
   if (!result.ok) {
+    // Write failure to coder_logs before throwing
+    writeCoderLog({
+      timestamp,
+      file: fix.file,
+      line: fix.line,
+      action: fix.action,
+      oldContent,
+      newContent: fix.newContent,
+      description: fix.description,
+      buildPassed: false,
+      buildAttempts: 1,
+      failReason: result.reason,
+    }).catch((err: unknown) => {
+      const e = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[Coder] coder_logs write failed: ${e.message}`);
+    });
+
     throw new Error(result.reason);
   }
 
@@ -103,6 +170,24 @@ export async function applyFixToGitHub(fix: FixSuggestion): Promise<{
 
   const commitSha = commitResponse.data.commit.sha ?? '';
   console.log(`[Coder] Committed SHA: ${commitSha}`);
+
+  // Write success to coder_logs
+  writeCoderLog({
+    timestamp,
+    file: fix.file,
+    line: fix.line,
+    action: fix.action,
+    oldContent,
+    newContent: fix.newContent,
+    description: fix.description,
+    branch,
+    commitSha,
+    buildPassed: true,
+    buildAttempts: 1,
+  }).catch((err: unknown) => {
+    const e = err instanceof Error ? err : new Error(String(err));
+    console.warn(`[Coder] coder_logs write failed: ${e.message}`);
+  });
 
   return { branch, commitSha };
 }
