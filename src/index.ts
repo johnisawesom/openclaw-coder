@@ -1,18 +1,23 @@
 import express, { Request, Response } from 'express';
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { applyFixToGitHub } from './github-file.js';
 import { ApplyRequest, ApplyResponse } from './types.js';
 import { callLLM } from './llm-router.js';
+import { CODER_CONSTITUTION } from './coder-constitution.js';
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT ?? '8080';
+const BOT_VERSION = '1.2.0';
 
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', bot: 'openclaw-coder', version: '1.1.0' });
+  res.json({ status: 'ok', bot: 'openclaw-coder', version: BOT_VERSION });
 });
 
-app.post('/apply', async (req: Request, res: Response) => {
+app.post('/apply', async (req: Request, res: Response): Promise<void> => {
   console.log('[Coder] Received /apply request');
 
   const body = req.body as Partial<ApplyRequest>;
@@ -55,8 +60,56 @@ app.post('/apply', async (req: Request, res: Response) => {
     return;
   }
 
+  // Log constitution context for observability
+  console.log(`[Coder] Constitution loaded — ${CODER_CONSTITUTION.length} chars`);
+  console.log(`[Coder] Applying fix — file: ${fix.file} line: ${fix.line} action: ${fix.action}`);
+  console.log(`[Coder] Description: ${fix.description}`);
+
+  // Generate enhanced description via LLM before applying
+  // This gives the commit message more context
+  let enhancedDescription = fix.description;
   try {
-    const { branch, commitSha } = await applyFixToGitHub(fix);
+    const llmResponse = await callLLM({
+      task: 'code_generation',
+      prompt: `${CODER_CONSTITUTION}
+
+A fix is about to be applied to the OpenClaw codebase.
+
+Fix details:
+- File: ${fix.file}
+- Line: ${fix.line}
+- Action: ${fix.action}
+- New content: ${fix.newContent}
+- Description: ${fix.description}
+
+Write a single concise git commit message for this change.
+Format: "fix: <what was wrong and how it was fixed>"
+Maximum 72 characters. No preamble. Just the commit message.`,
+      systemPrompt: 'You write concise git commit messages. One line only. Start with "fix: ". Maximum 72 characters.',
+      maxTokens: 80,
+    });
+
+    const cleaned = llmResponse.text
+      .replace(/^```.*\n?/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+
+    if (cleaned.length > 0 && cleaned.length <= 100) {
+      enhancedDescription = cleaned;
+      console.log(`[Coder] LLM commit message: ${enhancedDescription}`);
+    } else {
+      console.log(`[Coder] LLM message too long or empty — using original description`);
+    }
+  } catch (llmErr: unknown) {
+    const e = llmErr instanceof Error ? llmErr : new Error(String(llmErr));
+    console.warn(`[Coder] LLM commit message failed — using original: ${e.message}`);
+  }
+
+  try {
+    const { branch, commitSha } = await applyFixToGitHub({
+      ...fix,
+      description: enhancedDescription,
+    });
 
     const response: ApplyResponse = {
       status: 'ok',
@@ -81,9 +134,8 @@ app.post('/apply', async (req: Request, res: Response) => {
 });
 
 app.listen(parseInt(PORT), '0.0.0.0', () => {
-  console.log('[Coder] Boot confirmed — openclaw-coder v1.1.0');
-  console.log('[Coder] LLM router loaded — task: code_generation');
+  console.log(`[Coder] Boot confirmed — openclaw-coder v${BOT_VERSION}`);
+  console.log(`[Coder] LLM router loaded — task: code_generation`);
+  console.log(`[Coder] Constitution loaded — ${CODER_CONSTITUTION.length} chars`);
   console.log(`[Coder] Health server on port ${PORT}`);
 });
-
-void callLLM;
